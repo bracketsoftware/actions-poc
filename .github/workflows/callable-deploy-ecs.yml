@@ -1,0 +1,93 @@
+name: "Task: Deploy"
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: Target environment of deployment. (stg, prod)
+        required: true
+        type: string
+      container_digest:
+        description: 'The container sha256 digest to deploy'
+        required: true
+        type: string
+      application_name:
+        description: "Name of the application being deployed. One of 'dashboard', 'server', or 'gateway'"
+        required: true
+        type: string
+
+permissions:
+  contents: 'read'
+  id-token: 'write'
+
+concurrency:
+  group: ${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: ${{ inputs.application_name }}
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configuration
+        id: config
+        run: |
+          REPOSITORY_OWNER=$(tr "[:upper:]" "[:lower:]" <<< "${{ github.repository_owner }}")
+          echo "REPOSITORY_OWNER=${REPOSITORY_OWNER}" >> "$GITHUB_OUTPUT"
+
+          REPOSITORY_NAME=$(tr "[:upper:]" "[:lower:]" <<< "${{ github.event.repository.name }}")
+          echo "REPOSITORY_NAME=${REPOSITORY_NAME}" >> "$GITHUB_OUTPUT"
+
+          TARGET_IMAGE="ghcr.io/${REPOSITORY_OWNER}/${REPOSITORY_NAME}"
+          echo "TARGET_IMAGE=${TARGET_IMAGE}" >> "$GITHUB_OUTPUT"
+
+          TARGET_IMAGE_W_DIGEST="${TARGET_IMAGE}@${{ inputs.container_digest }}"
+          echo "TARGET_IMAGE_W_DIGEST=${TARGET_IMAGE_W_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # Translate the app_name to the name of the ecs container to update in the job config
+          to_container_name() {
+              case $1 in
+                  'dashboard') echo 'dashboard';;
+                  'server')    echo 'server';;
+                  'gateway')   echo 'gateway';;
+                  *) exit 1;;
+              esac
+          }
+          echo "TARGET_ECS_CONTAINER_NAME=$(to_container_name "${{ inputs.application_name }}")" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.IAM_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ vars.ECS_TASK_DEF_FAMILY }} \
+            --query taskDefinition \
+            > task.json
+          
+          # Remove Ignored Properties
+
+          echo "$( jq 'del(.compatibilities)'    task.json )" > task.json
+          echo "$( jq 'del(.taskDefinitionArn)'  task.json )" > task.json
+          echo "$( jq 'del(.requiresAttributes)' task.json )" > task.json
+          echo "$( jq 'del(.revision)'           task.json )" > task.json
+          echo "$( jq 'del(.status)'             task.json )" > task.json
+          echo "$( jq 'del(.registeredAt)'       task.json )" > task.json
+          echo "$( jq 'del(.registeredBy)'       task.json )" > task.json
+
+          # Update Image
+          echo "$( jq --arg target "${{ steps.config.outputs.TARGET_ECS_CONTAINER_NAME }}" --arg image "${{ steps.config.outputs.TARGET_IMAGE_W_DIGEST }}" '.containerDefinitions |= map((select(.name == $target) | .image) |= $image)' task.json )" > task.json
+          cat task.json
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: task.json
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
